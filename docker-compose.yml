@@ -1,0 +1,90 @@
+# AutoOps 运维自动化平台 —— Docker Compose 部署
+#
+# 用法：
+#   1. cp .env.docker.example .env  并改掉 SECRET_KEY / CREDENTIAL_SECRET
+#   2. docker compose up -d --build
+#   3. 打开 http://<服务器IP>:8080 ，账号 admin / admin123
+#
+# 切 PostgreSQL：docker compose --profile postgres up -d --build
+#   同时在 .env 里设置 DATABASE_URL=postgresql+psycopg2://autoops:autoops@postgres:5432/autoops
+
+name: autoops
+
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        INSTALL_ANSIBLE: ${INSTALL_ANSIBLE:-false}
+    image: autoops-backend:latest
+    container_name: autoops-backend
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/autoops.db}
+      SECRET_KEY: ${SECRET_KEY:?请在 .env 中设置 SECRET_KEY（可执行 openssl rand -base64 48 生成）}
+      CREDENTIAL_SECRET: ${CREDENTIAL_SECRET:?请在 .env 中设置 CREDENTIAL_SECRET（至少 32 字节）}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      EXECUTOR_BACKEND: ${EXECUTOR_BACKEND:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    volumes:
+      - autoops-data:/app/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+    image: autoops-frontend:latest
+    container_name: autoops-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 可选：PostgreSQL（默认不启动，需 --profile postgres）
+  postgres:
+    image: postgres:16-alpine
+    container_name: autoops-postgres
+    restart: unless-stopped
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autoops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autoops}
+      POSTGRES_DB: ${POSTGRES_DB:-autoops}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - autoops-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autoops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  autoops-data:
+  autoops-pgdata:

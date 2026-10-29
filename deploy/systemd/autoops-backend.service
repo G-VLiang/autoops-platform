@@ -1,0 +1,32 @@
+[Unit]
+Description=AutoOps Backend (FastAPI + APScheduler)
+Documentation=https://github.com/G-VLiang/autoops-platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+WorkingDirectory=__APP_DIR__/backend
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+
+# 配置从 backend/.env 读取（pydantic-settings 自动加载，WorkingDirectory 已指向 backend）
+# 关键：--workers 必须为 1。巡检计划调度器运行在进程内，多 worker 会导致同一计划被重复执行。
+ExecStart=__APP_DIR__/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers
+
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autoops-backend
+
+# 基础加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
