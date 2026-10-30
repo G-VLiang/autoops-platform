@@ -9,26 +9,47 @@ from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+ALGORITHM = "HS256"
+
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    if not hashed:
+        return False
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        return False
 
 
-def create_access_token(subject: str, expires_minutes: Optional[int] = None) -> str:
+def create_access_token(
+    subject: str,
+    tenant_id: Optional[str] = None,
+    role: Optional[str] = None,
+    expires_minutes: Optional[int] = None,
+) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=expires_minutes or settings.ACCESS_TOKEN_EXPIRE_MINUTES
     )
     payload = {"sub": subject, "exp": expire}
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+    if tenant_id:
+        payload["tid"] = tenant_id
+    if role:
+        payload["role"] = role
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
-def decode_token(token: str) -> Optional[str]:
+def decode_token(token: str) -> Optional[dict]:
+    """返回完整 payload；无效或过期返回 None。"""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        return payload.get("sub")
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
     except Exception:
         return None
+
+
+def decode_token_subject(token: str) -> Optional[str]:
+    payload = decode_token(token)
+    return payload.get("sub") if payload else None

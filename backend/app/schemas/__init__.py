@@ -13,6 +13,48 @@ class LoginRequest(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    username: str = ""
+    role: str = ""
+    tenant_id: str = ""
+    tenant_name: str = ""
+    is_super: bool = False
+    display_name: str = ""
+    auth_source: str = "local"
+
+
+class MeOut(BaseModel):
+    username: str
+    role: str
+    is_super: bool = False
+    display_name: str = ""
+    email: str = ""
+    auth_source: str = "local"
+    tenant_id: str = ""
+    tenant_name: str = ""
+    tenant_code: str = ""
+    last_login_at: Optional[datetime] = None
+
+
+# ---- Tenant ----
+class TenantCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=32, pattern=r"^[a-zA-Z0-9_-]+$")
+    name: str
+    description: str = ""
+    enabled: bool = True
+
+
+class TenantOut(BaseModel):
+    id: str
+    code: str
+    name: str
+    description: str = ""
+    enabled: bool = True
+    created_at: datetime
+    user_count: int = 0
+    host_count: int = 0
+
+    class Config:
+        from_attributes = True
 
 
 # ---- Host Group ----
@@ -53,10 +95,37 @@ class HostOut(BaseModel):
     tags: List[str]
     group_id: Optional[str]
     group_name: Optional[str] = None
+    last_seen: Optional[datetime] = None
+    probe_at: Optional[datetime] = None
+    probe_latency_ms: Optional[int] = None
+    probe_message: str = ""
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+# ---- Host Probe ----
+class ProbeRequest(BaseModel):
+    host_ids: List[str] = []      # 为空则探测当前租户全部主机
+    port: Optional[int] = None    # 不填则用主机自身 ssh 端口
+
+
+class ProbeItem(BaseModel):
+    host_id: str
+    hostname: str
+    ip: str
+    online: bool
+    latency_ms: Optional[int] = None
+    message: str = ""
+
+
+class ProbeSummary(BaseModel):
+    total: int
+    online: int
+    offline: int
+    elapsed_ms: int
+    results: List[ProbeItem] = []
 
 
 # ---- Task ----
@@ -66,6 +135,8 @@ class TaskCreate(BaseModel):
     content: str = ""
     target_type: str = "group"
     target_id: str = ""
+    max_retries: int = 0          # 失败后重试次数（0 = 不重试）
+    timeout_seconds: int = 0      # 整体执行超时，0 = 不限
 
 
 class TaskOut(BaseModel):
@@ -78,12 +149,36 @@ class TaskOut(BaseModel):
     status: str
     summary: dict
     created_by: str
+    artifact_uri: str = ""
+    max_retries: int = 0
+    timeout_seconds: int = 0
+    attempts: int = 0
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
 
     class Config:
         from_attributes = True
+
+
+class LibraryItem(BaseModel):
+    """预置作业模板。"""
+    key: str
+    name: str
+    category: str
+    description: str
+    task_type: str = "playbook"
+    content: str
+    tags: List[str] = []
+
+
+class TaskFromLibrary(BaseModel):
+    library_key: str
+    name: str = ""            # 留空则用模板名
+    target_type: str = "group"
+    target_id: str
+    max_retries: int = 0
+    timeout_seconds: int = 0
 
 
 class TaskLogOut(BaseModel):
@@ -175,6 +270,7 @@ class ReportOut(BaseModel):
     status: str
     summary: dict
     content: str
+    artifact_uri: str = ""
     created_at: datetime
 
     class Config:
@@ -187,6 +283,8 @@ class AlertConfigCreate(BaseModel):
     channel: str = "webhook"
     webhook_url: str = ""
     enabled: bool = True
+    min_severity: str = "info"              # 只推 >= 该级别
+    repeat_interval_minutes: int = 0        # 未恢复重复提醒间隔，0 = 只在状态变化时提醒
 
 
 class AlertConfigOut(BaseModel):
@@ -195,10 +293,66 @@ class AlertConfigOut(BaseModel):
     channel: str
     webhook_url: str
     enabled: bool
+    min_severity: str = "info"
+    repeat_interval_minutes: int = 0
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class AlertEventOut(BaseModel):
+    id: str
+    fingerprint: str
+    title: str
+    severity: str
+    status: str
+    resource_type: str
+    resource_id: str
+    detail: dict
+    occurrences: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    last_notified_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AlertSilenceCreate(BaseModel):
+    name: str = ""
+    scope: str = ""            # "" = 全局静默；否则为计划/主机 id
+    minutes: int = Field(default=60, ge=1, le=60 * 24 * 30)
+    reason: str = ""
+
+
+class AlertSilenceOut(BaseModel):
+    id: str
+    name: str
+    scope: str
+    starts_at: datetime
+    ends_at: datetime
+    reason: str
+    created_by: str
+    active: bool = True
+
+    class Config:
+        from_attributes = True
+
+
+# ---- Cron ----
+class CronPreviewRequest(BaseModel):
+    cron: str
+    count: int = 5
+
+
+class CronPreviewResponse(BaseModel):
+    valid: bool
+    expression: str = ""
+    description: str = ""
+    next_runs: List[datetime] = []
+    error: str = ""
 
 
 # ---- Credential ----

@@ -6,44 +6,53 @@
 
 | 模块 | 说明 |
 |------|------|
-| 资产管理 (CMDB) | 主机、主机组、标签、系统信息 |
-| 作业中心 | 批量命令 / Playbook / 巡检执行，实时日志、结果统计 |
+| 资产管理 (CMDB) | 主机、主机组、标签、系统信息，**批量探活**（TCP/ICMP、延迟、最后在线） |
+| 作业中心 | 批量命令 / Playbook / 巡检执行，实时日志、结果统计、**失败重试与超时控制**、**20+ 预置模板库一键执行** |
 | 巡检中心 | 巡检模板库 + **AI 自然语言生成巡检脚本**（草稿→人工批准→执行） |
-| 巡检计划 | **定时调度**（cron），自动执行巡检并生成报告，支持立即执行 |
-| 巡检报告 | 每次巡检留痕，历史报告查询、健康度统计 |
-| 告警通知 | 任务/巡检异常推送 webhook（钉钉/企微/通用） |
+| 巡检计划 | **定时调度**（cron 可视化编辑 + 下次执行时间预览），支持立即执行 |
+| 巡检报告 | 每次巡检留痕，历史报告查询，**导出 PDF / Excel（含逐主机明细）** |
+| 告警中心 | **分级告警**（严重/警告/提示）、按级别路由渠道、去重 + **恢复通知**、**维护期静默窗口**、人工确认恢复 |
 | 凭据管理 | SSH 密码/私钥 AES-256-GCM 加密存储，主机关联 |
 | RBAC 权限 | admin / operator / viewer 三级角色，接口级鉴权 |
-| 审计日志 | 登录、主机增删、任务执行、凭据操作全程留痕 |
+| 审计日志 | 全程留痕 + **组合筛选、分页、CSV 导出** |
 | 执行引擎 | 可切换 `mock`（演示）/ `ansible`（真实）后端 |
 | 大模型接入 | OpenAI 兼容接口（DeepSeek/通义/OpenAI 等），未配置时走 Mock |
-| 认证 | JWT 登录，默认账号 admin/admin123 |
+| 认证 | JWT 登录 + **LDAP 域账号** + **OIDC 单点登录（SSO）**，默认账号 admin/admin123 |
+| 多租户 | 租户级数据隔离（资产/任务/巡检/审计），平台超管可跨租户管理 |
+| 看板统计 | 执行趋势、巡检健康度、失败主机 Top、模板失败率等 ECharts 图表 |
+| 产物归档 | 任务明细/巡检报告压缩归档到本地磁盘或 S3 兼容对象存储，可下载 |
+| 分布式调度 | 数据库租约选主 + 心跳续约 + 计划级幂等去重，多实例部署不重复执行 |
+| 备份恢复 | SQLite 在线热备 / pg_dump、sha256 校验、保留轮转、一键恢复（deploy/backup.sh + cron 示例） |
+| CI 流水线 | GitHub Actions：编译 + 四套回归测试 + 前端构建 + 镜像构建验证 |
 
 ## 技术栈
 
 - 后端：Python 3.13 + FastAPI + SQLAlchemy + SQLite（可切 PostgreSQL）
-- 前端：React 18 + Ant Design 5 + Vite
+- 前端：React 18 + Ant Design 5 + ECharts 5 + Vite
 - 执行：ansible-runner（预留）+ Mock 模拟
 - 大模型：OpenAI 兼容 `chat/completions`
+- 可选依赖：ldap3（LDAP 登录）、boto3（S3 产物存储）
 
 ## 目录结构
 
 ```
 backend/
   app/
-    api/          # 路由（auth/hosts/tasks/inspections/plans/credentials/rbac）
-    core/         # 配置、数据库、安全(JWT)、凭据加密(AES)
-    models/       # SQLAlchemy 数据模型
+    api/          # 路由（auth/hosts/tasks/inspections/plans/alerts/audit/credentials/stats/tenants/system + scope/rbac）
+    core/         # 配置、数据库、增量迁移、安全(JWT)、凭据加密(AES)
+    models/       # SQLAlchemy 数据模型（含租户/调度锁/计划去重/告警事件与静默表）
     schemas/      # Pydantic 模型
-    services/     # 大模型、调度器(APScheduler)、告警、审计
+    services/     # 大模型、调度器(选主)、告警状态机、审计、身份源(LDAP/OIDC)、探活、报告导出、作业模板库、产物归档
     executor/     # 执行引擎（mock/ansible）
-  scripts/        # set_admin_password.py（重置密码）
+  scripts/        # set_admin_password.py + 四套回归测试 + backup.py（备份/恢复）
   requirements.txt
 frontend/
   src/
-    api/          # axios 封装
-    components/   # Layout
-    pages/        # Login/Dashboard/Hosts/Tasks/Inspections/Plans/Security
+    api/          # axios 封装（401 拦截/带鉴权下载）+ 会话管理
+    components/   # Layout、Chart(ECharts 封装)、ErrorBoundary、CronBuilder
+    pages/        # Login/SsoCallback/Dashboard/Hosts/Tasks/Inspections/Plans/Alerts/Security/Tenants/NotFound
+deploy/           # install.sh、backup.sh + cron 示例、systemd、nginx
+.github/          # CI 流水线
 ```
 
 ## 部署
@@ -120,7 +129,7 @@ CREDENTIAL_SECRET=           # 凭据加密密钥（生产必改，32 字节以�
 
 > 切换真实 Ansible：`EXECUTOR_BACKEND=ansible` 并 `pip install ansible-runner`。需确保目标机 SSH 免密或配置凭据。
 
-## 已实现（P0 MVP）
+## 功能全景（P0 ~ P2 全部落地）
 
 - [x] 认证登录（JWT）
 - [x] 主机/主机组增删查（CMDB）
@@ -128,16 +137,47 @@ CREDENTIAL_SECRET=           # 凭据加密密钥（生产必改，32 字节以�
 - [x] 巡检模板 CRUD + AI 自然语言生成脚本 + 草稿/批准流程
 - [x] 巡检计划（cron 定时调度 + 立即执行）
 - [x] 巡检报告（历史留痕 + 健康度）
-- [x] 告警通知（webhook 占位：钉钉/企微/通用）
+- [x] 告警通知（webhook：钉钉/企微/通用）
 - [x] 凭据管理（AES-256-GCM 加密存储）
-- [x] RBAC 多角色权限（admin/operator/viewer）
+- [x] RBAC 多角色权限（superadmin/admin/operator/viewer）
 - [x] 审计日志（操作全程留痕）
 - [x] 真实 ansible-runner 执行后端（可切换）
 - [x] 前端管理后台（看板/资产/作业/巡检/巡检计划/安全审计）
 - [x] 大模型 OpenAI 兼容接入（含 Mock 回退）
+- [x] **看板趋势图表**（执行结果按天堆叠柱 + 成功率线、巡检健康度趋势、主机状态环形图、失败主机 Top、模板失败率、分类/类型分布，支持 7/14/30 天切换）
+- [x] **多租户**（租户 CRUD、数据全链路隔离、超管跨租户视角、停用拦截）
+- [x] **LDAP 登录**（服务账号/用户 DN 模板两种绑定方式，首次登录自动开户）
+- [x] **OIDC SSO 登录**（Keycloak/Authing/Azure AD 等，组→角色映射，token 走 URL fragment 不进服务端日志）
+- [x] **任务产物归档**（local / S3 兼容双后端，gzip JSON，预签名下载，按天保留清理）
+- [x] **分布式调度**（DB 租约选主、leader 宕机 30s 内自动接管、计划时间槽唯一约束防重复执行）
 
-## 后续规划
+### 工程化（生产就绪）
 
-- [ ] 巡检报告历史趋势图、看板图表增强
-- [ ] 多租户、LDAP/SSO 登录
-- [ ] 任务结果持久化到远端存储、分布式调度
+- [x] **CI 流水线**（GitHub Actions：编译检查 + 四套回归测试 + 前端构建 + 镜像构建验证）
+- [x] **数据库备份/恢复**（SQLite 在线热备 / pg_dump、sha256 校验、篡改检测、保留轮转、一键恢复）
+- [x] **告警中心**（分级 info/warning/critical、按级别路由渠道、fingerprint 去重、恢复通知、维护期静默窗口、人工确认恢复）
+- [x] **主机批量探活**（TCP/ICMP 并发探测、延迟与最后在线时间、可配定时刷新、看板状态真实化）
+- [x] **前端健壮性**（异常边界不白屏、404 页、401 自动跳登录并带回跳地址）
+- [x] **作业模板库**（20+ 预置巡检剧本：磁盘/内存/CPU/服务/端口/日志/证书/Docker/Nginx/MySQL/Redis/安全基线等，一键执行）
+- [x] **任务失败重试 + 超时控制**（指数退避重试、整体超时中止、执行次数留痕）
+- [x] **cron 可视化编辑**（图形组合表达式 + 服务端校验 + 接下来 4 次执行时间预览）
+- [x] **巡检报告导出**（单份 PDF/Excel、近 30 天汇总 Excel；中文自动嵌入字体）
+- [x] **审计日志检索**（用户/操作/资源/关键词/时间范围组合筛选 + 分页 + CSV 导出）
+
+### 质量保障
+
+仓库自带四套可重复执行的回归测试（临时库，不污染数据）：
+
+```bash
+cd backend
+./venv/Scripts/python.exe scripts/smoke_test.py    # 33 项：租户隔离/看板/归档/调度选主与幂等
+./venv/Scripts/python.exe scripts/feature_test.py  # 69 项：探活/模板库/重试超时/导出/审计/告警状态机
+./venv/Scripts/python.exe scripts/auth_test.py     # 19 项：LDAP/OIDC 打桩全链路/角色映射/停用拦截
+./venv/Scripts/python.exe scripts/backup_test.py   # 9 项：备份→校验→破坏→恢复→回滚→篡改检测
+```
+
+## 已知限制
+
+- 多租户按「资源行隔离」实现：用户名全局唯一（跨租户不可重名），主机组名全局唯一
+- 产物存储为 local 时多实例需共享磁盘（或改用 s3 后端）；租约基于数据库，暂不支持 Redis
+- OIDC 需 IdP 支持标准授权码流程；LDAP 密码修改仍需在域内完成，平台不代改

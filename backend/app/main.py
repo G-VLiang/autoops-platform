@@ -9,14 +9,18 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.database import Base, engine, SessionLocal
+from app.core.migrate import run_migrations
 from app.api import api_router
 
 logger = logging.getLogger("autoops")
 
-# 建表
-Base.metadata.create_all(bind=engine)
+VERSION = "2.0.0"
 
-app = FastAPI(title=settings.APP_NAME)
+# 建表 + 增量补列（先建新表，再给老表补列）
+Base.metadata.create_all(bind=engine)
+run_migrations()
+
+app = FastAPI(title=settings.APP_NAME, version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,30 +35,50 @@ app.include_router(api_router, prefix=settings.API_PREFIX)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": settings.APP_NAME}
+    from app.services import scheduler
+    return {
+        "status": "ok",
+        "app": settings.APP_NAME,
+        "version": VERSION,
+        "instance": scheduler.election.id,
+        "scheduler_role": scheduler.election.role,
+    }
 
 
 def init_seed():
-    """初始化默认管理员账号与演示数据。"""
-    from app.models import User, HostGroup, Host, InspectionTemplate
+    """初始化默认租户、平台管理员与演示数据。"""
+    from app.models import User, HostGroup, Host, InspectionTemplate, Tenant, DEFAULT_TENANT_ID
     from app.core.security import hash_password
 
     db = SessionLocal()
     try:
-        if not db.query(User).filter(User.username == "admin").first():
-            db.add(User(username="admin", hashed_password=hash_password("admin123"), role="admin"))
+        if not db.query(Tenant).filter(Tenant.id == DEFAULT_TENANT_ID).first():
+            db.add(Tenant(id=DEFAULT_TENANT_ID, code="default", name="默认租户",
+                          description="系统默认租户，不可删除"))
+            db.commit()
+
+        admin = db.query(User).filter(User.username == "admin").first()
+        if not admin:
+            db.add(User(username="admin", hashed_password=hash_password("admin123"),
+                        role="superadmin", tenant_id=DEFAULT_TENANT_ID, is_super=True,
+                        display_name="平台管理员", auth_source="local"))
+        elif not admin.is_super:
+            # 老库升级：首个 admin 提升为平台超管，否则新功能（租户管理）无人可用
+            admin.is_super = True
+            admin.role = "superadmin"
+            admin.tenant_id = admin.tenant_id or DEFAULT_TENANT_ID
+            logger.info("已将 admin 提升为平台超管（superadmin）")
 
         if not db.query(HostGroup).filter(HostGroup.name == "生产环境").first():
-            g = HostGroup(name="生产环境", description="生产服务器组")
+            g = HostGroup(name="生产环境", description="生产服务器组", tenant_id=DEFAULT_TENANT_ID)
             db.add(g)
             db.flush()
-            demo_hosts = [
-                Host(hostname="web-01", ip="192.168.1.10", os_type="linux", os_version="CentOS 7.9", group_id=g.id, tags=["web"]),
-                Host(hostname="web-02", ip="192.168.1.11", os_type="linux", os_version="CentOS 7.9", group_id=g.id, tags=["web"]),
-                Host(hostname="db-01", ip="192.168.1.20", os_type="linux", os_version="Ubuntu 22.04", group_id=g.id, tags=["db", "mysql"]),
-                Host(hostname="cache-01", ip="192.168.1.30", os_type="linux", os_version="Debian 11", group_id=g.id, tags=["redis"]),
-            ]
-            db.add_all(demo_hosts)
+            db.add_all([
+                Host(hostname="web-01", ip="192.168.1.10", os_type="linux", os_version="CentOS 7.9", group_id=g.id, tags=["web"], tenant_id=DEFAULT_TENANT_ID),
+                Host(hostname="web-02", ip="192.168.1.11", os_type="linux", os_version="CentOS 7.9", group_id=g.id, tags=["web"], tenant_id=DEFAULT_TENANT_ID),
+                Host(hostname="db-01", ip="192.168.1.20", os_type="linux", os_version="Ubuntu 22.04", group_id=g.id, tags=["db", "mysql"], tenant_id=DEFAULT_TENANT_ID),
+                Host(hostname="cache-01", ip="192.168.1.30", os_type="linux", os_version="Debian 11", group_id=g.id, tags=["redis"], tenant_id=DEFAULT_TENANT_ID),
+            ])
 
         if not db.query(InspectionTemplate).first():
             db.add(InspectionTemplate(
@@ -63,6 +87,7 @@ def init_seed():
                 category="custom",
                 status="approved",
                 generated_by_llm=False,
+                tenant_id=DEFAULT_TENANT_ID,
                 playbook="""---
 - name: 系统基础巡检
   hosts: all
@@ -113,20 +138,10 @@ def on_shutdown():
 
 
 def _start_scheduler():
-    """启动调度器，并注册所有启用的巡检计划。"""
+    """启动调度器：先竞争 leader 租约，成为 leader 后才注册计划作业。"""
     from app.services import scheduler
-    from app.models import InspectionPlan
     from app.api.plans import run_plan_job
-
-    db = SessionLocal()
-    try:
-        plans = db.query(InspectionPlan).filter(InspectionPlan.enabled == True).all()
-        for p in plans:
-            if p.cron:
-                scheduler.register_plan(p.id, p.cron, run_plan_job)
-    finally:
-        db.close()
-    scheduler.start()
+    scheduler.start(run_plan_job)
 
 
 def _mount_frontend(dist: Path):

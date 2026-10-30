@@ -12,7 +12,16 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: { main: 'index.html' },
+      output: {
+        // 把体积大且更新频率低的库拆成独立 chunk，利用浏览器缓存
+        manualChunks: {
+          react: ['react', 'react-dom', 'react-router-dom'],
+          antd: ['antd', '@ant-design/icons'],
+          echarts: ['echarts', 'echarts/core', 'echarts/charts', 'echarts/components', 'echarts/renderers'],
+        },
+      },
     },
+    chunkSizeWarningLimit: 1200,
   },
   server: {
     port: 5173,

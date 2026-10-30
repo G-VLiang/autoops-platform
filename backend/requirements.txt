@@ -19,3 +19,13 @@ cryptography==50.0.2
 
 # 可选：DATABASE_URL 切 PostgreSQL 时需要驱动
 psycopg2-binary==2.9.10
+
+# 可选：LDAP 域账号登录（LDAP_ENABLED=true 时需要）
+ldap3==2.9.1
+
+# 可选：任务产物存 S3 兼容对象存储（ARTIFACT_BACKEND=s3 时需要；MinIO/OSS/COS 通用）
+boto3==1.43.121
+
+# 巡检报告导出（Excel / PDF）
+openpyxl==3.1.5
+fpdf2==2.9.0

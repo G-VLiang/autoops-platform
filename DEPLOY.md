@@ -18,6 +18,10 @@
 | `start-prod.bat` 逻辑 | ✅ 逻辑与已验证的单进程模式一致 |
 | `docker-compose.yml` / 两个 Dockerfile | ⚠️ 本机未装 Docker，**未实际构建**；YAML 已校验，依赖安装步骤已用干净环境等效验证 |
 | `deploy/install.sh`（Linux） | ⚠️ 本机是 Windows，无法执行，仅做语法检查；systemd/nginx 片段为标准写法 |
+| 端到端回归 `scripts/smoke_test.py`（33 项）与 `scripts/auth_test.py`（19 项） | ✅ 全部通过（租户隔离/看板/归档/幂等/LDAP-OIDC 打桩） |
+| 多实例选主与宕机接管 | ✅ 双进程实测：leader 被杀后 standby 30s 内自动晋升 |
+| 老库增量迁移（补 tenant_id 等列） | ✅ 在已有开发库上实测，历史数据自动归入 default 租户 |
+| 看板图表与登录/租户页面渲染 | ✅ 无头浏览器实拍验证（登录页/看板/租户管理） |
 
 ---
 
@@ -226,6 +230,22 @@ start-prod.bat
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容接口；留空则 AI 生成走内置模板 |
 | `CORS_ORIGINS` | `http://localhost:5173,...` | 允许的跨域来源，逗号分隔 |
 | `WEB_PORT` | `8080` / `80` | 仅 compose 与 install.sh 使用 |
+| `FRONTEND_URL` | `http://localhost:5173` | SSO 回调后跳转的前端地址 |
+| `INSTANCE_ID` | 自动生成 | 多实例部署时的实例标识（容器里建议显式指定） |
+| `SCHEDULER_ENABLED` | `true` | 设 `false` 让实例只对外服务、不参与调度选主 |
+| `SCHEDULER_LEASE_TTL` / `SCHEDULER_HEARTBEAT` | `30` / `10` | leader 租约秒数 / 心跳间隔 |
+| `ARTIFACT_BACKEND` | `local` | `local` 本地磁盘 / `s3` 对象存储（需 boto3） |
+| `ARTIFACT_DIR` | `./data/artifacts` | local 后端的存储目录（Docker 内挂到卷里） |
+| `ARTIFACT_S3_*` | 空 | S3 兼容存储的 endpoint/bucket/密钥，见第 8 节 |
+| `ARTIFACT_RETENTION_DAYS` | `30` | 产物保留天数，0 = 永久；每天 03:30 自动清理 |
+| `PROBE_METHOD` | `tcp` | 主机探活方式：`tcp` 连 SSH 端口（推荐）/ `ping` ICMP |
+| `PROBE_TIMEOUT_SECONDS` | `3` | 单台探测超时 |
+| `HOST_PROBE_INTERVAL_MINUTES` | `0` | 定时探活间隔（分钟），0 = 只能手动探测 |
+| `ALERT_AUTO_RESOLVE_MINUTES` | `0` | 未恢复告警超过该分钟数未复现则自动关闭，0 = 不自动关闭 |
+| `TASK_DEFAULT_MAX_RETRIES` | `0` | 任务失败默认重试次数（创建任务时可单独指定） |
+| `TASK_DEFAULT_TIMEOUT_SECONDS` | `0` | 任务默认整体超时（秒），0 = 不限 |
+| `LDAP_*` | 关闭 | LDAP 域账号登录，见第 9 节 |
+| `OIDC_*` | 关闭 | OIDC 单点登录（SSO），见第 9 节 |
 
 > 启动时会自检：若 `SECRET_KEY` / `CREDENTIAL_SECRET` 仍是默认值，日志会打印 `[安全告警]`。看到就说明还没配好。
 
@@ -311,3 +331,184 @@ compose 故意做了强校验。复制 `.env.docker.example` 为 `.env` 并填�
 
 **Q: 时间不对（巡检计划按错误时区触发）**
 设置 `TZ=Asia/Shanghai`（compose 和 systemd 都已默认设置）。
+
+---
+
+## 7. 多实例部署与分布式调度
+
+调度器基于 **数据库租约选主**：多副本部署时自动只有一个实例执行定时巡检，其余待命。
+
+```
+实例启动 → 抢租约(scheduler_locks 表) ──成功──→ leader：注册全部 cron 作业，每 10s 续约
+                    └──失败──→ standby：不注册作业，每 10s 重试抢占
+leader 宕机 → 租约 30s 过期 → 某个 standby 抢到 → 晋升 leader（30s 内自动接管）
+```
+
+- 即使出现瞬时双 leader，巡检执行还会经过 `plan_runs` 表的**时间槽唯一约束**去重（`计划ID@分钟`），
+  同一分钟内同一计划只会真正执行一次。
+- 查看当前角色：`GET /api/v1/system/status`，或页面「安全审计 → 系统状态」。
+- 想让某实例**只对外服务不跑定时任务**（如前置多台只读副本）：设 `SCHEDULER_ENABLED=false`。
+- 重建调度作业（改过 cron 想立即生效）：`POST /api/v1/system/scheduler/reload`。
+
+Docker Compose 扩展副本示例（SQLite 仅建议单写；多实例请配 PostgreSQL）：
+
+```bash
+docker compose up -d --scale backend=2
+```
+
+> SQLite + 多实例不推荐（写并发差）；生产多实例一律用 PostgreSQL。
+
+## 8. 任务产物归档（本地 / S3 对象存储）
+
+任务执行明细（含每台主机完整 stdout）和巡检报告会 gzip 压缩归档，数据库只存指针。
+
+**本地磁盘（默认）**
+
+```ini
+ARTIFACT_BACKEND=local
+ARTIFACT_DIR=./data/artifacts      # Docker 内改为 /app/data/artifacts 并挂卷
+ARTIFACT_RETENTION_DAYS=30         # 0 = 永久保留
+```
+
+**S3 兼容对象存储**（AWS S3 / MinIO / 阿里云 OSS / 腾讯云 COS）
+
+```bash
+pip install boto3                  # 镜像里已包含
+```
+
+```ini
+ARTIFACT_BACKEND=s3
+ARTIFACT_S3_BUCKET=autoops-artifacts
+ARTIFACT_S3_ENDPOINT=http://127.0.0.1:9000   # MinIO 示例；AWS S3 留空
+ARTIFACT_S3_ACCESS_KEY=xxx
+ARTIFACT_S3_SECRET_KEY=xxx
+ARTIFACT_S3_REGION=us-east-1
+```
+
+下载：任务详情/报告页调用 `GET /api/v1/tasks/{id}/artifact`；
+local 直接返回文件，s3 返回**预签名 URL**（默认 1 小时有效，`ARTIFACT_PRESIGN_SECONDS` 可调）。
+
+## 9. 企业登录（LDAP / OIDC SSO）
+
+登录页自动探测可用登录方式（`GET /api/v1/auth/providers`）。
+外部账号**首次登录自动开户**，角色/租户按配置映射；本地账号始终可用，两者并存。
+
+**LDAP（AD / OpenLDAP）**
+
+```ini
+LDAP_ENABLED=true
+LDAP_SERVER=ldap://dc.corp.local
+LDAP_BASE_DN=dc=corp,dc=local
+# 方式一：服务账号搜索（AD 推荐）
+LDAP_BIND_DN=svc-autoops@corp.local
+LDAP_BIND_PASSWORD=******
+LDAP_USER_FILTER=(sAMAccountName={username})
+# 方式二：用户 DN 模板直连绑定（OpenLDAP 常用）
+# LDAP_USER_DN_TEMPLATE=uid={username},ou=people,dc=corp,dc=local
+LDAP_DEFAULT_ROLE=operator     # 自动开户的默认角色
+LDAP_DEFAULT_TENANT=default    # 自动开户的默认租户
+```
+
+**OIDC 单点登录**（Keycloak / Authing / Azure AD / 钉钉等标准授权码流程）
+
+```ini
+OIDC_ENABLED=true
+OIDC_ISSUER=https://idp.example.com
+OIDC_CLIENT_ID=autoops
+OIDC_CLIENT_SECRET=******
+OIDC_REDIRECT_URI=https://ops.example.com/api/v1/auth/oidc/callback
+OIDC_SCOPES=openid profile email
+OIDC_ROLE_MAP=platform-admins:admin,ops-team:operator   # IdP 组 -> 平台角色
+OIDC_DEFAULT_ROLE=operator
+```
+
+在 IdP 侧登记回调地址 `OIDC_REDIRECT_URI` 即可。登录成功后 token 通过 URL
+fragment（`#token=...`）传回前端，不会出现在服务端访问日志。
+
+## 10. 多租户
+
+- 平台超管（首个 `admin`）可跨租户管理：页面「租户管理」，或 API `/api/v1/tenants`。
+- 普通用户只能看到本租户的资产/任务/巡检/审计；越权访问一律 404（不泄露存在性）。
+- 超管可用请求头 `X-Tenant-Id: <租户id或code>` 收窄到单个租户视角。
+- 停用租户：该租户用户立即无法登录与访问（默认租户不可停用）。
+- 老库升级：启动时自动补列，历史数据全部归入 `default` 租户，`admin` 自动提升为平台超管。
+
+## 11. 回归测试
+
+```bash
+cd backend
+./venv/Scripts/python.exe scripts/smoke_test.py   # 33 项：核心链路 + 租户隔离 + 调度选主/幂等
+./venv/Scripts/python.exe scripts/auth_test.py    # 19 项：LDAP/OIDC 打桩全链路
+```
+
+全部使用临时数据库，可放心在任何环境重复执行。
+
+---
+
+## 12. 数据库备份与恢复
+
+数据只有一份，误删不可再生 —— 上线第一件事就是把备份配好。
+
+```bash
+cd backend
+
+# 备份数据库（SQLite 在线热备，不锁库、不中断服务）
+python scripts/backup.py
+
+# 连任务产物一起打包
+python scripts/backup.py --with-artifacts --keep 14     # 只保留最近 14 份
+
+# 查看已有备份 / 校验
+python scripts/backup.py --list
+python scripts/backup.py --verify 20261030-030000
+
+# 恢复（恢复前会把当前库另存为 *.pre-restore，误操作可回退）
+python scripts/backup.py --restore 20261030-030000
+```
+
+- PostgreSQL 部署自动改用 `pg_dump`（需安装 postgresql-client）。
+- 每份备份带 `manifest.json`（sha256），恢复前先校验哈希；文件被篡改会拒绝恢复（`--force` 可跳过，危险）。
+- Linux 定时任务：`sudo cp deploy/backup.cron.example /etc/cron.d/autoops-backup`，每天 03:00 自动备份并轮转，周日额外校验备份可读性。
+- 建议把 `backend/backups/` 目录同步到另一块盘或对象存储（rsync / rclone 均可）。
+
+## 13. 主机探活
+
+CMDB 里的主机状态默认是静态的，探活让它变成真实状态：
+
+- **手动**：资产页「立即探测」（全部）或行内「探测」（单台）。
+- **定时**：`HOST_PROBE_INTERVAL_MINUTES=10` 开启，调度 leader 每 10 分钟刷一轮。
+- 方式：`PROBE_METHOD=tcp`（默认，连 SSH 端口；云主机禁 ping 也能测）/ `ping`。
+- 探测结果写入 `status` / `last_seen` / `probe_latency_ms`，看板与资产页直接展示。
+
+## 14. 告警中心
+
+「告警中心」页面 = 告警事件 + 通知渠道 + 静默窗口三部分：
+
+| 能力 | 说明 |
+|---|---|
+| 分级 | failed → 严重（critical）、partial → 警告（warning），webhook 渠道可设「最低推送级别」做分级路由 |
+| 去重 | 同一资源（按 fingerprint）连续异常只提醒一次，不再刷屏 |
+| 恢复通知 | 问题恢复后自动补一条「已恢复」（含持续时长），值班不用反复确认 |
+| 静默窗口 | 计划内变更期间创建静默（全局或仅某巡检计划），告警只记录不推送 |
+| 重复提醒 | 渠道可配 `repeat_interval_minutes`，未恢复的告警每 N 分钟再提醒一次 |
+| 人工确认 | 平台外解决问题后，可在页面「标记恢复」 |
+
+任务失败与巡检计划失败都会进入同一套状态机；手动任务每次独立告警，巡检按计划聚合。
+
+## 15. 报告导出与审计检索
+
+- 巡检报告：报告列表行内「PDF / Excel」按钮；右上角「导出近 30 天汇总」出汇总表。
+  PDF 需要服务器有中文字体（Docker 镜像已内置 `fonts-droid-fallback`；裸机 Debian/Ubuntu
+  执行 `apt install fonts-droid-fallback` 即可），无字体时接口返回 501 并提示改用 Excel。
+- 审计日志：支持 用户 / 操作类型 / 资源类型 / 关键词 / 时间范围 组合筛选、分页，
+  「导出 CSV」带 UTF-8 BOM，Excel 直接打开不乱码。
+
+## 16. CI 流水线
+
+`.github/workflows/ci.yml` 在 push / PR 时自动执行：
+
+1. 后端：装依赖 → 编译检查 → `smoke_test` → `feature_test` → `auth_test` → `backup_test`
+2. 前端：`npm ci` + `npm run build`
+3. 镜像：构建 backend / frontend Docker 镜像（不推送，只验证可构建）
+
+全部通过才算合格；推送前本地可先跑一遍同款命令。

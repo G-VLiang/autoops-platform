@@ -1,18 +1,22 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Button, Modal, Form, Input, Select, Tag, Space, Popconfirm, message, Tabs, Switch, Drawer, Descriptions, Empty } from 'antd'
-import { PlusOutlined, PlayCircleOutlined, BellOutlined, FileTextOutlined } from '@ant-design/icons'
+import {
+  Alert, Button, Card, Descriptions, Drawer, Form, Input, Modal, Popconfirm, Select, Space,
+  Switch, Table, Tabs, Tag, message,
+} from 'antd'
+import {
+  BellOutlined, DownloadOutlined, FileExcelOutlined, FilePdfOutlined, PlusOutlined,
+  PlayCircleOutlined,
+} from '@ant-design/icons'
+import { Link } from 'react-router-dom'
 import {
   listPlans, createPlan, updatePlan, deletePlan, runPlan,
-  listTemplates, listGroups, listHosts,
-  listReports, listAlerts, createAlert, deleteAlert, testAlert,
+  listTemplates, listGroups, listHosts, listReports, reportExportUrl, reportsExportAllUrl,
 } from '../api/modules'
+import { download } from '../api/index'
+import CronBuilder from '../components/CronBuilder'
 
 const statusColor = { success: 'green', failed: 'red', partial: 'orange' }
-const cronOptions = [
-  { label: '每天 02:00', value: 'daily' },
-  { label: '每小时', value: 'hourly' },
-  { label: '每 30 分钟', value: 'every30min' },
-]
+const statusLabel = { success: '成功', failed: '失败', partial: '部分失败' }
 
 export default function InspectionPlans() {
   const [plans, setPlans] = useState([])
@@ -20,12 +24,10 @@ export default function InspectionPlans() {
   const [groups, setGroups] = useState([])
   const [hosts, setHosts] = useState([])
   const [reports, setReports] = useState([])
-  const [alerts, setAlerts] = useState([])
   const [planModal, setPlanModal] = useState(false)
-  const [alertModal, setAlertModal] = useState(false)
-  const [reportDrawer, setReportDrawer] = useState(false)
+  const [reportDrawer, setReportDrawer] = useState(null)
+  const [busy, setBusy] = useState('')
   const [form] = Form.useForm()
-  const [alertForm] = Form.useForm()
 
   const load = () => {
     listPlans().then((r) => setPlans(r.data)).catch(() => {})
@@ -33,50 +35,86 @@ export default function InspectionPlans() {
     listGroups().then((r) => setGroups(r.data)).catch(() => {})
     listHosts().then((r) => setHosts(r.data)).catch(() => {})
     listReports().then((r) => setReports(r.data)).catch(() => {})
-    listAlerts().then((r) => setAlerts(r.data)).catch(() => {})
   }
 
   useEffect(load, [])
 
   const submitPlan = async () => {
     const values = await form.validateFields()
-    await createPlan(values)
-    message.success('计划已创建')
-    setPlanModal(false)
-    form.resetFields()
-    load()
+    try {
+      await createPlan(values)
+      message.success('计划已创建')
+      setPlanModal(false)
+      form.resetFields()
+      load()
+    } catch (e) {
+      message.error(e?.response?.data?.detail || '创建失败')
+    }
   }
 
   const doRun = async (plan) => {
-    await runPlan(plan.id)
-    message.success('巡检已执行')
-    load()
+    setBusy(plan.id)
+    try {
+      await runPlan(plan.id)
+      message.success('巡检已执行')
+      load()
+    } catch (e) {
+      message.error(e?.response?.data?.detail || '执行失败')
+    } finally {
+      setBusy('')
+    }
   }
 
   const toggleEnabled = async (plan, checked) => {
-    await updatePlan(plan.id, { name: plan.name, template_id: plan.template_id, target_type: plan.target_type, target_id: plan.target_id, cron: plan.cron, enabled: checked })
+    await updatePlan(plan.id, {
+      name: plan.name, template_id: plan.template_id, target_type: plan.target_type,
+      target_id: plan.target_id, cron: plan.cron, enabled: checked,
+    })
     load()
   }
 
-  const submitAlert = async () => {
-    const values = await alertForm.validateFields()
-    await createAlert(values)
-    message.success('告警配置已保存')
-    setAlertModal(false)
-    alertForm.resetFields()
-    load()
+  const exportReport = async (report, format) => {
+    setBusy(`exp-${report.id}-${format}`)
+    try {
+      await download(
+        reportExportUrl(report.id, format),
+        `巡检报告-${report.plan_name}.${format}`,
+      )
+      message.success(`已导出 ${format.toUpperCase()}`)
+    } catch (e) {
+      const detail = e?.response?.data?.detail
+      message.error(detail || '导出失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const exportAll = async () => {
+    setBusy('exp-all')
+    try {
+      await download(reportsExportAllUrl(30), '巡检报告汇总-近30天.xlsx')
+      message.success('汇总表已导出')
+    } catch (e) {
+      message.error(e?.response?.data?.detail || '导出失败')
+    } finally {
+      setBusy('')
+    }
   }
 
   const planColumns = [
     { title: '名称', dataIndex: 'name' },
     { title: '巡检模板', dataIndex: 'template_name', render: (v) => v || '-' },
     { title: '调度', dataIndex: 'cron', render: (v) => <Tag color="blue">{v}</Tag> },
-    { title: '启用', dataIndex: 'enabled', render: (v, r) => <Switch size="small" checked={v} onChange={(c) => toggleEnabled(r, c)} /> },
-    { title: '上次执行', dataIndex: 'last_run_at', render: (v) => v ? new Date(v).toLocaleString() : '-' },
     {
-      title: '操作', render: (_, r) => (
-        <Space>
-          <Button type="link" size="small" icon={<PlayCircleOutlined />} onClick={() => doRun(r)}>立即执行</Button>
+      title: '启用', dataIndex: 'enabled',
+      render: (v, r) => <Switch size="small" checked={v} onChange={(c) => toggleEnabled(r, c)} />,
+    },
+    { title: '上次执行', dataIndex: 'last_run_at', render: (v) => (v ? new Date(v).toLocaleString() : '-') },
+    {
+      title: '操作', width: 180, render: (_, r) => (
+        <Space size={0}>
+          <Button type="link" size="small" icon={<PlayCircleOutlined />}
+            loading={busy === r.id} onClick={() => doRun(r)}>立即执行</Button>
           <Popconfirm title="确定删除？" onConfirm={async () => { await deletePlan(r.id); load() }}>
             <Button type="link" danger size="small">删除</Button>
           </Popconfirm>
@@ -88,23 +126,29 @@ export default function InspectionPlans() {
   const reportColumns = [
     { title: '计划', dataIndex: 'plan_name' },
     { title: '模板', dataIndex: 'template_name' },
-    { title: '状态', dataIndex: 'status', render: (v) => <Tag color={statusColor[v]}>{v}</Tag> },
-    { title: '结果', dataIndex: 'summary', render: (s) => <Space size={4}>{Object.entries(s || {}).map(([k, v]) => <Tag key={k}>{k}:{v}</Tag>)}</Space> },
-    { title: '时间', dataIndex: 'created_at', render: (v) => new Date(v).toLocaleString() },
-  ]
-
-  const alertColumns = [
-    { title: '名称', dataIndex: 'name' },
-    { title: '渠道', dataIndex: 'channel', render: (v) => <Tag color="geekblue">{v}</Tag> },
-    { title: 'Webhook', dataIndex: 'webhook_url', render: (v) => v || <span style={{ color: '#999' }}>未配置</span> },
-    { title: '启用', dataIndex: 'enabled', render: (v) => v ? <Tag color="green">是</Tag> : <Tag>否</Tag> },
     {
-      title: '操作', render: (_, r) => (
-        <Space>
-          <Button type="link" size="small" onClick={async () => { await testAlert(r.id); message.info('测试已发送（未配 webhook 则仅记录日志）') }}>测试</Button>
-          <Popconfirm title="确定删除？" onConfirm={async () => { await deleteAlert(r.id); load() }}>
-            <Button type="link" danger size="small">删除</Button>
-          </Popconfirm>
+      title: '状态', dataIndex: 'status',
+      render: (v) => <Tag color={statusColor[v]}>{statusLabel[v] || v}</Tag>,
+    },
+    {
+      title: '结果', dataIndex: 'summary',
+      render: (s) => (
+        <Space size={4}>
+          {Object.entries(s || {}).map(([k, v]) => <Tag key={k}>{k}:{v}</Tag>)}
+        </Space>
+      ),
+    },
+    { title: '时间', dataIndex: 'created_at', width: 175, render: (v) => new Date(v).toLocaleString() },
+    {
+      title: '操作', width: 220, render: (_, r) => (
+        <Space size={0}>
+          <Button type="link" size="small" onClick={() => setReportDrawer(r)}>详情</Button>
+          <Button type="link" size="small" icon={<FilePdfOutlined />}
+            loading={busy === `exp-${r.id}-pdf`}
+            onClick={() => exportReport(r, 'pdf')}>PDF</Button>
+          <Button type="link" size="small" icon={<FileExcelOutlined />}
+            loading={busy === `exp-${r.id}-xlsx`}
+            onClick={() => exportReport(r, 'xlsx')}>Excel</Button>
         </Space>
       ),
     },
@@ -114,7 +158,16 @@ export default function InspectionPlans() {
     <div>
       <Card
         title="巡检计划"
-        extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setPlanModal(true)}>新建计划</Button>}
+        extra={
+          <Space>
+            <Button icon={<DownloadOutlined />} loading={busy === 'exp-all'} onClick={exportAll}>
+              导出近 30 天汇总
+            </Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setPlanModal(true)}>
+              新建计划
+            </Button>
+          </Space>
+        }
       >
         <Tabs
           items={[
@@ -123,25 +176,32 @@ export default function InspectionPlans() {
               children: <Table rowKey="id" dataSource={plans} columns={planColumns} />,
             },
             {
-              key: 'reports', label: <span><FileTextOutlined /> 巡检报告</span>,
+              key: 'reports', label: '巡检报告',
               children: <Table rowKey="id" dataSource={reports} columns={reportColumns} />,
             },
             {
-              key: 'alerts', label: <span><BellOutlined /> 告警配置</span>,
+              key: 'alerts', label: <span><BellOutlined /> 告警</span>,
               children: (
-                <div>
-                  <Button icon={<PlusOutlined />} onClick={() => setAlertModal(true)} style={{ marginBottom: 12 }}>添加告警</Button>
-                  <Table rowKey="id" dataSource={alerts} columns={alertColumns} />
-                </div>
+                <Alert
+                  type="info" showIcon
+                  message="告警配置已整合到「告警中心」"
+                  description={(
+                    <span>
+                      现在支持告警分级（严重/警告/提示）、按级别路由不同渠道、未恢复去重、
+                      恢复通知与维护期静默。入口：左侧菜单 <Link to="/alerts">告警中心</Link>。
+                    </span>
+                  )}
+                />
               ),
             },
           ]}
         />
       </Card>
 
-      {/* 新建计划 */}
-      <Modal title="新建巡检计划" open={planModal} onOk={submitPlan} onCancel={() => setPlanModal(false)}>
-        <Form form={form} layout="vertical" initialValues={{ target_type: 'group', cron: 'daily', enabled: true }}>
+      <Modal title="新建巡检计划" open={planModal} onOk={submitPlan}
+        onCancel={() => setPlanModal(false)} width={620}>
+        <Form form={form} layout="vertical"
+          initialValues={{ target_type: 'group', cron: '0 2 * * *', enabled: true }}>
           <Form.Item name="name" label="计划名称" rules={[{ required: true }]}><Input /></Form.Item>
           <Form.Item name="template_id" label="巡检模板" rules={[{ required: true }]}>
             <Select options={templates.map((t) => ({ label: t.name, value: t.id }))} />
@@ -151,14 +211,16 @@ export default function InspectionPlans() {
           </Form.Item>
           <Form.Item name="target_id" label="目标" rules={[{ required: true }]}>
             <Select
+              showSearch optionFilterProp="label"
               options={[
                 ...groups.map((g) => ({ label: `[组] ${g.name}`, value: g.id })),
                 ...hosts.map((h) => ({ label: `[主机] ${h.hostname}`, value: h.id })),
               ]}
             />
           </Form.Item>
-          <Form.Item name="cron" label="调度周期">
-            <Select options={cronOptions} />
+          <Form.Item name="cron" label="调度周期" rules={[{ required: true }]}
+            extra="可视化选择或直接写 cron 表达式，下方会显示接下来几次执行时间">
+            <CronBuilder />
           </Form.Item>
           <Form.Item name="enabled" label="启用" valuePropName="checked">
             <Switch />
@@ -166,21 +228,44 @@ export default function InspectionPlans() {
         </Form>
       </Modal>
 
-      {/* 添加告警 */}
-      <Modal title="添加告警配置" open={alertModal} onOk={submitAlert} onCancel={() => setAlertModal(false)}>
-        <Form form={alertForm} layout="vertical" initialValues={{ channel: 'webhook', enabled: true }}>
-          <Form.Item name="name" label="名称" rules={[{ required: true }]}><Input /></Form.Item>
-          <Form.Item name="channel" label="渠道">
-            <Select options={[
-              { label: '通用 Webhook', value: 'webhook' },
-              { label: '钉钉机器人', value: 'dingtalk' },
-              { label: '企业微信机器人', value: 'wecom' },
-            ]} />
-          </Form.Item>
-          <Form.Item name="webhook_url" label="Webhook 地址"><Input placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." /></Form.Item>
-          <Form.Item name="enabled" label="启用" valuePropName="checked"><Switch /></Form.Item>
-        </Form>
-      </Modal>
+      <Drawer
+        title={reportDrawer ? `巡检报告 - ${reportDrawer.plan_name}` : '巡检报告'}
+        open={!!reportDrawer} onClose={() => setReportDrawer(null)} width={620}
+        extra={reportDrawer && (
+          <Space>
+            <Button icon={<FilePdfOutlined />} onClick={() => exportReport(reportDrawer, 'pdf')}>PDF</Button>
+            <Button icon={<FileExcelOutlined />} onClick={() => exportReport(reportDrawer, 'xlsx')}>Excel</Button>
+          </Space>
+        )}
+      >
+        {reportDrawer && (
+          <>
+            <Descriptions column={1} bordered size="small">
+              <Descriptions.Item label="计划">{reportDrawer.plan_name}</Descriptions.Item>
+              <Descriptions.Item label="模板">{reportDrawer.template_name}</Descriptions.Item>
+              <Descriptions.Item label="状态">
+                <Tag color={statusColor[reportDrawer.status]}>
+                  {statusLabel[reportDrawer.status] || reportDrawer.status}
+                </Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="结果">
+                {Object.entries(reportDrawer.summary || {}).map(([k, v]) => (
+                  <Tag key={k}>{k}:{v}</Tag>
+                ))}
+              </Descriptions.Item>
+              <Descriptions.Item label="执行时间">
+                {new Date(reportDrawer.created_at).toLocaleString()}
+              </Descriptions.Item>
+            </Descriptions>
+            {reportDrawer.content && (
+              <pre style={{
+                background: '#f6f8fa', padding: 12, borderRadius: 6, marginTop: 16,
+                fontSize: 12, whiteSpace: 'pre-wrap',
+              }}>{reportDrawer.content}</pre>
+            )}
+          </>
+        )}
+      </Drawer>
     </div>
   )
 }
